@@ -1,121 +1,390 @@
 import re
 import cv2
-import ollama
+import torch
 import numpy as np
 from PIL import Image
 from huggingface_hub import hf_hub_download
-from ultralytics import YOLO 
+from ultralytics import YOLO
+from transformers import AutoProcessor, AutoModelForCausalLM
 
 from utils import *
 
-# DETECTOR MODEL (YOLOv8 DocLayNet)
-# This model is specifically trained to find 'Pictures', 'Tables', 'Formulas' in docs.
-# YOLO_REPO = "hantian/yolo-doclaynet"
-# YOLO_FILENAME = "yolov8n-doclaynet.pt"
+# ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
 
+# YOLO DocLayNet
 YOLO_REPO = "hantian/yolo-doclaynet"
-YOLO_FILENAME = "yolov12m-doclaynet.pt"  # Medium is significantly better than Nano
+YOLO_FILENAME = "yolov12m-doclaynet.pt"
+
+# Florence-2 (replaces slow VLM calls for figure detection + verification)
+FLORENCE_MODEL_ID = "microsoft/Florence-2-base"
 
 # --- GLOBAL MODEL CACHE ---
 yolo_model = None
+florence_model = None
+florence_processor = None
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
 def load_yolo():
     """Downloads and loads the YOLO Document Layout model."""
     global yolo_model
-    print(f"⏳ Loading Detector (YOLOv8 DocLayNet)...")
-    
+    print(f"⏳ Loading Detector (YOLO DocLayNet)...")
+
     try:
-        # 1. Download weights from HuggingFace
         model_path = hf_hub_download(repo_id=YOLO_REPO, filename=YOLO_FILENAME)
-        
-        # 2. Load model using standard Ultralytics syntax
         yolo_model = YOLO(model_path)
-        
-        print(f"✅ Detector Loaded! Classes: {yolo_model.names}")
-        
+        print(f"✅ YOLO Loaded! Classes: {yolo_model.names}")
     except Exception as e:
         print(f"❌ Failed to load YOLO: {e}")
-        print("   (Check your internet connection or HuggingFace status)")
         exit(1)
+
+
+def load_florence():
+    """Downloads and loads Florence-2 for figure detection & verification."""
+    global florence_model, florence_processor
+    print(f"⏳ Loading Florence-2 ({FLORENCE_MODEL_ID})...")
+
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if device == "cuda" else torch.float32
+
+        florence_model = AutoModelForCausalLM.from_pretrained(
+            FLORENCE_MODEL_ID,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        ).to(device)
+
+        florence_processor = AutoProcessor.from_pretrained(
+            FLORENCE_MODEL_ID,
+            trust_remote_code=True,
+        )
+
+        print(f"✅ Florence-2 Loaded on {device} ({dtype})")
+    except Exception as e:
+        print(f"❌ Failed to load Florence-2: {e}")
+        exit(1)
+
+
+def _florence_run(pil_image, task, text_input=""):
+    """
+    Run a Florence-2 inference task on a PIL image.
+    Returns the parsed result dict.
+    """
+    device = florence_model.device
+    dtype = florence_model.dtype
+
+    prompt = task if not text_input else task + text_input
+
+    inputs = florence_processor(
+        text=prompt,
+        images=pil_image,
+        return_tensors="pt",
+    ).to(device, dtype)
+
+    with torch.no_grad():
+        generated_ids = florence_model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=1024,
+            do_sample=False,
+            num_beams=3,
+        )
+
+    generated_text = florence_processor.batch_decode(
+        generated_ids, skip_special_tokens=False
+    )[0]
+
+    parsed = florence_processor.post_process_generation(
+        generated_text, task=task, image_size=(pil_image.width, pil_image.height)
+    )
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# YOLO detection (pass 1 — fast)
+# ---------------------------------------------------------------------------
 
 def preprocess_for_yolo(pil_image):
     img_np = np.array(pil_image)
-    # Convert to LAB color space to process lightness only
     lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
-    
-    # Apply CLAHE to the L-channel
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     cl = clahe.apply(l)
-    
-    # Merge back and convert to RGB
     limg = cv2.merge((cl, a, b))
     final_img = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
     return Image.fromarray(final_img)
 
+
 def detect_figures_yolo(pil_image):
     """
-    Uses YOLOv8 to find figures/tables using standard Ultralytics API.
+    Uses YOLO DocLayNet to find figures/tables.
     """
     global yolo_model
 
-    # 1. Perform object detection on an image
-    #    conf=0.25 is standard confidence threshold
-    results = yolo_model(pil_image, conf=0.2, verbose=False)
-    
+    results = yolo_model(pil_image, conf=0.25, verbose=False)
     found_boxes = []
-    
-    # 2. Extract results
-    #    The result is a list (one per image), we only processed one.
     result = results[0]
-    
-    # 3. Iterate through detected boxes
+
     for box in result.boxes:
-        # Get the class ID (int)
         cls_id = int(box.cls[0])
-        # Get the class name (string)
         class_name = result.names[cls_id].lower()
-        
-        # --- STRICT FILTERING ---
-        # We explicitly WANT these:
-        target_classes = ['picture', 'image', 'chart', 'graph', 'drawing']
 
-        # We explicitly BLOCK these:
-        blocked_classes = ['formula', 'math', 'equation', 'text', 'caption', 'footer', 'header'] 
+        # DocLayNet classes: caption, footnote, formula, list-item,
+        # page-footer, page-header, picture, section-header, table, text, title
+        target_classes = ['picture', 'table']
+        blocked_classes = ['formula', 'text', 'caption', 'footnote',
+                           'page-footer', 'page-header', 'list-item',
+                           'section-header', 'title']
 
-        # Check if it matches a target AND is not blocked
         is_target = any(t in class_name for t in target_classes)
         is_blocked = any(b in class_name for b in blocked_classes)
 
         if is_target and not is_blocked:
-            # Get coordinates [x1, y1, x2, y2]
             coords = box.xyxy[0].tolist()
             found_boxes.append(coords)
-                
+
     return found_boxes
+
+
+# ---------------------------------------------------------------------------
+# Florence-2 detection (pass 2 — catches what YOLO misses)
+# ---------------------------------------------------------------------------
+
+def detect_figures_florence(pil_image):
+    """
+    Uses Florence-2 phrase grounding to locate figures on the page.
+    Returns a list of [x1, y1, x2, y2] boxes in pixel coordinates.
+    """
+    task = "<CAPTION_TO_PHRASE_GROUNDING>"
+    text_input = "diagram, graph, chart, drawing, sketch, figure, picture, table"
+
+    try:
+        result = _florence_run(pil_image, task, text_input)
+        data = result.get(task, {})
+
+        bboxes = data.get("bboxes", [])
+        labels = data.get("labels", [])
+
+        boxes = []
+        for bbox, label in zip(bboxes, labels):
+            if len(bbox) == 4:
+                x1, y1, x2, y2 = [int(c) for c in bbox]
+                if x2 > x1 and y2 > y1:
+                    boxes.append([x1, y1, x2, y2])
+        return boxes
+
+    except Exception as e:
+        print(f"      ⚠️ Florence-2 detection failed: {e}")
+        return []
+
+
+def verify_figure_florence(pil_crop):
+    """
+    Uses Florence-2 captioning to determine if a crop is a figure/diagram
+    or just text.  Returns True if it looks like a figure.
+    """
+    task = "<CAPTION>"
+
+    try:
+        result = _florence_run(pil_crop, task)
+        caption = result.get(task, "").lower()
+
+        # Figure-like keywords
+        figure_kws = ['diagram', 'graph', 'chart', 'drawing', 'sketch',
+                      'figure', 'picture', 'image', 'plot', 'illustration',
+                      'table', 'circuit', 'map', 'flow', 'arrow', 'shape',
+                      'circle', 'rectangle', 'line', 'curve', 'box']
+        # Text-only keywords (reject if ONLY these match)
+        text_kws = ['text', 'handwriting', 'writing', 'equation', 'formula',
+                    'letter', 'word', 'sentence', 'paragraph', 'note',
+                    'number', 'math']
+
+        has_figure = any(kw in caption for kw in figure_kws)
+        has_text = any(kw in caption for kw in text_kws)
+
+        # Accept if it mentions figure-like content, even if also mentions text
+        if has_figure:
+            return True
+        # Reject if it only mentions text-like content
+        if has_text and not has_figure:
+            return False
+        # Ambiguous — keep it (err on inclusion)
+        return True
+
+    except Exception as e:
+        print(f"      ⚠️ Florence-2 verification failed: {e}")
+        return True
+
+
+def refine_crop_florence(pil_crop):
+    """
+    Uses Florence-2 phrase grounding on a crop to find just the diagram
+    region, excluding surrounding text.
+    """
+    task = "<CAPTION_TO_PHRASE_GROUNDING>"
+    text_input = "diagram, graph, chart, drawing, figure"
+
+    try:
+        result = _florence_run(pil_crop, task, text_input)
+        data = result.get(task, {})
+        bboxes = data.get("bboxes", [])
+
+        if not bboxes:
+            return pil_crop
+
+        # Pick the largest detected region
+        best = max(bboxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+        x1, y1, x2, y2 = [int(c) for c in best]
+
+        # Sanity: refined box must be at least 25% of original
+        refined_area = (x2 - x1) * (y2 - y1)
+        original_area = pil_crop.width * pil_crop.height
+        if refined_area > (original_area * 0.25) and x2 > x1 and y2 > y1:
+            return pil_crop.crop((x1, y1, x2, y2))
+
+    except Exception as e:
+        print(f"      ⚠️ Florence-2 refinement failed: {e}")
+
+    return pil_crop
+
+
+# ---------------------------------------------------------------------------
+# Box merging utilities
+# ---------------------------------------------------------------------------
+
+def _iou(box_a, box_b):
+    """Compute intersection-over-union of two [x1,y1,x2,y2] boxes."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0
+
+
+def _overlap_ratio(box_a, box_b):
+    """Fraction of box_a that overlaps with box_b."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    return inter / area_a if area_a > 0 else 0
+
+
+def merge_boxes(yolo_boxes, florence_boxes, iou_threshold=0.3):
+    """
+    Merge two sets of bounding boxes, removing near-duplicates.
+    When two boxes overlap significantly, keep the larger one.
+    """
+    all_boxes = list(yolo_boxes) + list(florence_boxes)
+    if not all_boxes:
+        return []
+
+    all_boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+
+    merged = []
+    used = [False] * len(all_boxes)
+
+    for i in range(len(all_boxes)):
+        if used[i]:
+            continue
+        best = list(all_boxes[i])
+        used[i] = True
+        for j in range(i + 1, len(all_boxes)):
+            if used[j]:
+                continue
+            if (_iou(best, all_boxes[j]) > iou_threshold
+                    or _overlap_ratio(all_boxes[j], best) > 0.5):
+                used[j] = True
+        merged.append(best)
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Hybrid detection pipeline (YOLO + Florence-2)
+# ---------------------------------------------------------------------------
+
+def detect_figures_hybrid(pil_image):
+    """
+    Two-pass hybrid figure detection:
+      1. YOLO fast pass     — finds obvious 'picture' / 'table' regions
+      2. Florence-2 scan    — phrase-grounded detection for missed figures
+      3. Merge & dedupe     — combine both sets, remove overlaps
+      4. Florence-2 verify  — caption-based false-positive filtering
+    Returns a list of verified [x1, y1, x2, y2] boxes.
+    """
+    width, height = pil_image.size
+    page_area = width * height
+
+    # --- Pass 1: YOLO ---
+    yolo_boxes = detect_figures_yolo(pil_image)
+    print(f"      YOLO found {len(yolo_boxes)} candidate(s)")
+
+    # --- Pass 2: Florence-2 ---
+    florence_boxes = detect_figures_florence(pil_image)
+    print(f"      Florence-2 found {len(florence_boxes)} candidate(s)")
+
+    # --- Merge ---
+    merged = merge_boxes(yolo_boxes, florence_boxes)
+    print(f"      Merged to {len(merged)} unique region(s)")
+
+    # --- Filter obvious bad boxes ---
+    filtered = []
+    for box in merged:
+        x1, y1, x2, y2 = map(int, box)
+        box_area = (x2 - x1) * (y2 - y1)
+        if box_area > (page_area * 0.50):
+            continue
+        if (x2 - x1) < 50 or (y2 - y1) < 50:
+            continue
+        filtered.append([x1, y1, x2, y2])
+
+    # --- Pass 3: Florence-2 verification ---
+    verified = []
+    for box in filtered:
+        x1, y1, x2, y2 = box
+        pad = 10
+        cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+        cx2, cy2 = min(width, x2 + pad), min(height, y2 + pad)
+        crop = pil_image.crop((cx1, cy1, cx2, cy2))
+
+        if verify_figure_florence(crop):
+            verified.append(box)
+            print(f"      ✓ Region ({x1},{y1})-({x2},{y2}) verified as figure")
+        else:
+            print(f"      ✗ Region ({x1},{y1})-({x2},{y2}) rejected (text/equation)")
+
+    print(f"      Final: {len(verified)} verified figure(s)")
+    return verified
+
+
+# ---------------------------------------------------------------------------
+# Crop refinement & saving
+# ---------------------------------------------------------------------------
 
 def smart_crop_whitespace(pil_image):
     """
     Splits image based on vertical whitespace gaps (columns).
     Keeps the largest segment (the graph).
     """
-    # 1. Convert to binary numpy array (0 = white, 1 = ink)
     img = np.array(pil_image.convert('L'))
-    # Invert: Text is now high value (255), paper is 0
     img = 255 - img
-    # Threshold to pure 0/1
     _, img = cv2.threshold(img, 20, 1, cv2.THRESH_BINARY)
 
-    # 2. Calculate Vertical Projection (Sum of ink in each column)
-    # shape: (width,)
     projection = np.sum(img, axis=0)
-
-    # 3. Find gaps (columns with very little ink)
     height = img.shape[0]
-    # If a column has less than 1% ink coverage, it's a gap
-    is_ink = projection > (height * 0.01) 
-    
-    # 4. Find connected segments of "Ink"
+    is_ink = projection > (height * 0.01)
+
     segments = []
     start = None
     for x, has_ink in enumerate(is_ink):
@@ -127,131 +396,79 @@ def smart_crop_whitespace(pil_image):
     if start is not None:
         segments.append((start, len(is_ink)))
 
-    # 5. If no separation found, return original
     if not segments:
         return pil_image
 
-    # 6. Find the "heaviest" segment (most ink total)
-    # This assumes the graph has more ink density/area than the text note
     best_segment = max(segments, key=lambda s: np.sum(projection[s[0]:s[1]]))
-    
-    # 7. Crop to that segment
     x1, x2 = best_segment
-    # Add a little padding (10px)
     x1 = max(0, x1 - 10)
     x2 = min(pil_image.width, x2 + 10)
-    
+
     return pil_image.crop((x1, 0, x2, pil_image.height))
+
 
 def is_crop_dirty(pil_crop):
     """
-    Runs YOLO on the crop to see if it contains significant text blocks.
+    Runs YOLO on the crop to check for significant text blocks.
+    Only marks dirty if text covers >10% of the crop area.
     """
-    # Run YOLO with a slightly higher confidence to avoid false positives
     results = yolo_model(pil_crop, conf=0.3, verbose=False)
     result = results[0]
-    
+    crop_area = pil_crop.width * pil_crop.height
+
     for box in result.boxes:
         cls_id = int(box.cls[0])
         class_name = result.names[cls_id].lower()
-        
-        # If YOLO finds 'text' or 'caption' inside our figure crop, it's dirty
+
         if class_name in ['text', 'caption', 'list-item']:
-            # Optional: Only mark dirty if the text box is large
-            # x1, y1, x2, y2 = box.xyxy[0].tolist()
-            # if (x2-x1)*(y2-y1) > (pil_crop.width * pil_crop.height * 0.1):
-            return True
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            text_area = (x2 - x1) * (y2 - y1)
+            if text_area > (crop_area * 0.10):
+                return True
     return False
 
-def refine_crop_with_vlm(pil_crop, model):
-    """
-    Sends a 'dirty' crop to Qwen3-VL and asks it to find the 
-    precise coordinates of JUST the diagram, ignoring the text.
-    """
-    img_bytes = pil_to_bytes(pil_crop)
-    
-    # We use a very strict prompt for visual grounding
-    PROMPT = """
-    In this image, there is a diagram mixed with handwritten text. 
-    Find the bounding box of ONLY the diagram/graph. 
-    Exclude all surrounding math equations and text.
-    Return the coordinates in JSON format: {"box": [ymin, xmin, ymax, xmax]} (scale 0-1000).
-    """
 
-    try:
-        response = ollama.chat(
-            model,
-            messages=[{'role': 'user', 'content': PROMPT, 'images': [img_bytes]}]
-        )
-        content = response['message']['content']
-        
-        # Look for the coordinate pattern [ymin, xmin, ymax, xmax]
-        match = re.search(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', content)
-        if match:
-            # Parse coordinates (Qwen uses 0-1000 normalized scale)
-            ymin, xmin, ymax, xmax = map(int, match.groups())
-            
-            w, h = pil_crop.size
-            left = xmin * w / 1000
-            top = ymin * h / 1000
-            right = xmax * w / 1000
-            bottom = ymax * h / 1000
-            
-            # Perform the sub-crop
-            return pil_crop.crop((left, top, right, bottom))
-    except Exception as e:
-        print(f"      ⚠️ VLM Refinement failed: {e}")
-    
-    return pil_crop # Fallback to original if AI fails
-
-def crop_and_save_figures(original_img, bboxes, page_num, pdf_name, figures_dir, model):
+def crop_and_save_figures(original_img, bboxes, page_num, pdf_name, figures_dir):
+    """
+    Crops detected figure regions, refines them, and saves to disk.
+    Accepts pre-filtered bboxes from the hybrid detection pipeline.
+    Uses Florence-2 for refinement (no Ollama VLM needed).
+    """
     saved_md_links = []
     width, height = original_img.size
     figures_dir.mkdir(parents=True, exist_ok=True)
-    
-    page_area = width * height
 
     for idx, box in enumerate(bboxes):
         x1, y1, x2, y2 = map(int, box)
 
-        # 1. Whole Page Filter (Adjusted to 0.40 as you requested)
-        box_area = (x2 - x1) * (y2 - y1)
-        if box_area > (page_area * 0.40):
-            continue
-
-        # 2. Padding
+        # Padding
         pad = 20
         x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
         x2, y2 = min(width, x2 + pad), min(height, y2 + pad)
 
-        # 3. Tiny Box Filter
-        if (x2 - x1) < 50 or (y2 - y1) < 50:
-            continue
-
         # --- CROP & REFINE ---
         crop = original_img.crop((x1, y1, x2, y2))
-        
-        # First attempt: Whitespace cleaning
+
+        # Whitespace cleaning pass
         crop = smart_crop_whitespace(crop)
-        
-        # Second attempt: Loop whitespace if still dirty
+
+        # Loop whitespace if still dirty (limit to 3 passes)
         dirty_counter = 0
-        while is_crop_dirty(crop) and dirty_counter < 10: # Reduced to 3 for speed
+        while is_crop_dirty(crop) and dirty_counter < 3:
             crop = smart_crop_whitespace(crop)
             dirty_counter += 1
-        
-        # --- NEW: FINAL VLM BEGGING PHASE ---
-        crop = refine_crop_with_vlm(crop, model)
-        
-        # Save logic
+
+        # Final Florence-2 refinement if still dirty
+        if is_crop_dirty(crop):
+            crop = refine_crop_florence(crop)
+
+        # Save
         clean_name = pdf_name.replace(".pdf", "").replace(" ", "_")
         filename = f"{clean_name}_p{page_num}_fig{idx+1}.jpg"
         save_path = figures_dir / filename
         crop.save(save_path, quality=95)
-        
+
         rel_path = f"figures/{filename}"
         saved_md_links.append(f"![Figure {idx+1}]({rel_path})")
-        
+
     return saved_md_links
-
-

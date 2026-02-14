@@ -5,7 +5,9 @@ from pdf2image import convert_from_path
 from tqdm import tqdm
 
 from utils import *
-from figure_detection import preprocess_for_yolo, crop_and_save_figures, detect_figures_yolo, load_yolo
+from figure_detection import (preprocess_for_yolo, crop_and_save_figures,
+                              detect_figures_yolo, detect_figures_hybrid,
+                              load_yolo, load_florence)
 from ocr import preprocess_for_ocr, transcribe_text
 
 # --- CONFIGURATION ---
@@ -37,16 +39,15 @@ def process_pdf(pdf_path, output_file):
     
     for i, original_img in pbar:
         # 0. preprocess into yolo
-        # pbar set whatever
         # detect_processed_img = preprocess_for_yolo(original_img)
 
-        # 1. Detection (YOLO)
-        pbar.set_description(f"Page {i+1} | Detecting (YOLOv8)")
-        bboxes = detect_figures_yolo(original_img)
+        # 1. Hybrid Detection (YOLO + Florence-2)
+        pbar.set_description(f"Page {i+1} | Detecting (Hybrid)")
+        bboxes = detect_figures_hybrid(original_img)
 
         # 2. Cropping
         pbar.set_description(f"Page {i+1} | Cropping {len(bboxes)} figs")
-        fig_links = crop_and_save_figures(original_img, bboxes, i+1, pdf_path.name, figures_dir, OCR_MODEL)
+        fig_links = crop_and_save_figures(original_img, bboxes, i+1, pdf_path.name, figures_dir)
         
         user_input = input(f"Continue with preprocessing? [Y/n]:").strip().lower()
         if user_input == 'n':
@@ -74,7 +75,8 @@ def process_pdf(pdf_path, output_file):
 
 def main():
     check_gpu_status()
-    load_yolo() 
+    load_yolo()
+    load_florence()
     
     in_dir = Path(input_path)
     out_dir = Path(output_path)

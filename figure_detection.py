@@ -1,14 +1,11 @@
-import os
 import re
 import cv2
 import torch
 import numpy as np
 from PIL import Image
-from unittest.mock import patch
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 from transformers import AutoProcessor, AutoModelForCausalLM
-from transformers.dynamic_module_utils import get_imports
 
 from utils import *
 
@@ -27,15 +24,6 @@ FLORENCE_MODEL_ID = "microsoft/Florence-2-base"
 yolo_model = None
 florence_model = None
 florence_processor = None
-
-
-def _fixed_get_imports(filename: str | os.PathLike) -> list[str]:
-    """Workaround: remove false 'flash_attn' requirement from Florence-2."""
-    imports = get_imports(filename)
-    if str(filename).endswith("modeling_florence2.py") and "flash_attn" in imports:
-        imports.remove("flash_attn")
-    return imports
-
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -64,18 +52,16 @@ def load_florence():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
 
-        with patch("transformers.dynamic_module_utils.get_imports", _fixed_get_imports):
-            florence_model = AutoModelForCausalLM.from_pretrained(
-                FLORENCE_MODEL_ID,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-                attn_implementation="sdpa",
-            ).to(device)
+        florence_model = AutoModelForCausalLM.from_pretrained(
+            FLORENCE_MODEL_ID,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        ).to(device)
 
-            florence_processor = AutoProcessor.from_pretrained(
-                FLORENCE_MODEL_ID,
-                trust_remote_code=True,
-            )
+        florence_processor = AutoProcessor.from_pretrained(
+            FLORENCE_MODEL_ID,
+            trust_remote_code=True,
+        )
 
         print(f"✅ Florence-2 Loaded on {device} ({dtype})")
     except Exception as e:
@@ -139,7 +125,7 @@ def detect_figures_yolo(pil_image):
     """
     global yolo_model
 
-    results = yolo_model(pil_image, conf=0.15, verbose=False)
+    results = yolo_model(pil_image, conf=0.25, verbose=False)
     found_boxes = []
     result = results[0]
 
@@ -149,11 +135,8 @@ def detect_figures_yolo(pil_image):
 
         # DocLayNet classes: caption, footnote, formula, list-item,
         # page-footer, page-header, picture, section-header, table, text, title
-        # NOTE: 'formula' included as target because handwritten diagrams
-        # with axes/labels are often misclassified as formula by DocLayNet.
-        # Florence-2 verification will filter out actual formulas later.
-        target_classes = ['picture', 'table', 'formula']
-        blocked_classes = ['text', 'caption', 'footnote',
+        target_classes = ['picture', 'table']
+        blocked_classes = ['formula', 'text', 'caption', 'footnote',
                            'page-footer', 'page-header', 'list-item',
                            'section-header', 'title']
 
@@ -177,9 +160,7 @@ def detect_figures_florence(pil_image):
     Returns a list of [x1, y1, x2, y2] boxes in pixel coordinates.
     """
     task = "<CAPTION_TO_PHRASE_GROUNDING>"
-    text_input = ("diagram, graph, chart, drawing, sketch, figure, picture, table, "
-                  "handwritten diagram, handdrawn figure, doodle, annotation, "
-                  "circuit, flowchart, plot, axis, coordinate")
+    text_input = "diagram, graph, chart, drawing, sketch, figure, picture, table"
 
     try:
         result = _florence_run(pil_image, task, text_input)
@@ -216,25 +197,14 @@ def verify_figure_florence(pil_crop):
         figure_kws = ['diagram', 'graph', 'chart', 'drawing', 'sketch',
                       'figure', 'picture', 'image', 'plot', 'illustration',
                       'table', 'circuit', 'map', 'flow', 'arrow', 'shape',
-                      'circle', 'rectangle', 'line', 'curve', 'box',
-                      'axis', 'coordinate', 'vector', 'angle', 'triangle',
-                      'geometric', 'grid', 'bar', 'pie', 'scatter',
-                      'hand drawn', 'handdrawn', 'doodle', 'ink',
-                      'pen', 'pencil', 'marker', 'annotation']
+                      'circle', 'rectangle', 'line', 'curve', 'box']
         # Text-only keywords (reject if ONLY these match)
-        # NOTE: 'handwriting' and 'writing' intentionally excluded —
-        # Florence-2 captions handwritten diagrams as "handwriting" which
-        # would cause false rejections.
-        text_kws = ['text', 'equation', 'formula',
-                    'letter', 'word', 'sentence', 'paragraph',
+        text_kws = ['text', 'handwriting', 'writing', 'equation', 'formula',
+                    'letter', 'word', 'sentence', 'paragraph', 'note',
                     'number', 'math']
 
         has_figure = any(kw in caption for kw in figure_kws)
         has_text = any(kw in caption for kw in text_kws)
-
-        # Log caption for debugging detection decisions
-        print(f"        Florence-2 caption: \"{caption}\" "
-              f"[figure={has_figure}, text_only={has_text and not has_figure}]")
 
         # Accept if it mentions figure-like content, even if also mentions text
         if has_figure:
@@ -283,6 +253,64 @@ def refine_crop_florence(pil_crop):
 
 
 # ---------------------------------------------------------------------------
+# Box merging utilities
+# ---------------------------------------------------------------------------
+
+def _iou(box_a, box_b):
+    """Compute intersection-over-union of two [x1,y1,x2,y2] boxes."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0
+
+
+def _overlap_ratio(box_a, box_b):
+    """Fraction of box_a that overlaps with box_b."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    return inter / area_a if area_a > 0 else 0
+
+
+def merge_boxes(yolo_boxes, florence_boxes, iou_threshold=0.3):
+    """
+    Merge two sets of bounding boxes, removing near-duplicates.
+    When two boxes overlap significantly, keep the larger one.
+    """
+    all_boxes = list(yolo_boxes) + list(florence_boxes)
+    if not all_boxes:
+        return []
+
+    all_boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+
+    merged = []
+    used = [False] * len(all_boxes)
+
+    for i in range(len(all_boxes)):
+        if used[i]:
+            continue
+        best = list(all_boxes[i])
+        used[i] = True
+        for j in range(i + 1, len(all_boxes)):
+            if used[j]:
+                continue
+            if (_iou(best, all_boxes[j]) > iou_threshold
+                    or _overlap_ratio(all_boxes[j], best) > 0.5):
+                used[j] = True
+        merged.append(best)
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Hybrid detection pipeline (YOLO + Florence-2)
 # ---------------------------------------------------------------------------
 
@@ -291,7 +319,7 @@ def detect_figures_hybrid(pil_image):
     Two-pass hybrid figure detection:
       1. YOLO fast pass     — finds obvious 'picture' / 'table' regions
       2. Florence-2 scan    — phrase-grounded detection for missed figures
-      3. Size filtering     — remove obviously bad boxes
+      3. Merge & dedupe     — combine both sets, remove overlaps
       4. Florence-2 verify  — caption-based false-positive filtering
     Returns a list of verified [x1, y1, x2, y2] boxes.
     """
@@ -306,20 +334,18 @@ def detect_figures_hybrid(pil_image):
     florence_boxes = detect_figures_florence(pil_image)
     print(f"      Florence-2 found {len(florence_boxes)} candidate(s)")
 
-    # --- Combine all candidates ---
-    all_boxes = list(yolo_boxes) + list(florence_boxes)
-    print(f"      Combined {len(all_boxes)} total candidate(s)")
+    # --- Merge ---
+    merged = merge_boxes(yolo_boxes, florence_boxes)
+    print(f"      Merged to {len(merged)} unique region(s)")
 
     # --- Filter obvious bad boxes ---
-    # Loosened thresholds for handwritten content: handwritten figures
-    # tend to be larger and less precisely bounded than printed ones.
     filtered = []
-    for box in all_boxes:
+    for box in merged:
         x1, y1, x2, y2 = map(int, box)
         box_area = (x2 - x1) * (y2 - y1)
-        if box_area > (page_area * 0.65):
+        if box_area > (page_area * 0.50):
             continue
-        if (x2 - x1) < 30 or (y2 - y1) < 30:
+        if (x2 - x1) < 50 or (y2 - y1) < 50:
             continue
         filtered.append([x1, y1, x2, y2])
 

@@ -5,9 +5,7 @@ from pdf2image import convert_from_path
 from tqdm import tqdm
 
 from utils import *
-from figure_detection import (preprocess_for_yolo, crop_and_save_figures,
-                              detect_figures_yolo, detect_figures_hybrid,
-                              load_yolo, load_florence)
+from figure_detection import *
 from ocr import preprocess_for_ocr, transcribe_text
 
 # --- CONFIGURATION ---
@@ -43,7 +41,7 @@ def process_pdf(pdf_path, output_file):
 
         # 1. Hybrid Detection (YOLO + Florence-2)
         pbar.set_description(f"Page {i+1} | Detecting (Hybrid)")
-        bboxes = detect_figures_hybrid(original_img)
+        bboxes = detect_figures_qwen(original_img, OCR_MODEL)
 
         # 2. Cropping
         pbar.set_description(f"Page {i+1} | Cropping {len(bboxes)} figs")

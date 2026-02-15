@@ -2,6 +2,8 @@ import re
 import cv2
 import torch
 import numpy as np
+import ollama
+import json
 from PIL import Image
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
@@ -74,8 +76,8 @@ def _florence_run(pil_image, task, text_input=""):
     Run a Florence-2 inference task on a PIL image.
     Returns the parsed result dict.
     """
-    device = florence_model.device
-    dtype = florence_model.dtype
+    device = florence_model.device # type: ignore
+    dtype = florence_model.dtype # type: ignore
 
     prompt = task if not text_input else task + text_input
 
@@ -83,7 +85,7 @@ def _florence_run(pil_image, task, text_input=""):
         text=prompt,
         images=pil_image,
         return_tensors="pt",
-    ).to(device, dtype)
+        ).to(device, dtype)# type: ignore 
 
     with torch.no_grad():
         generated_ids = florence_model.generate(
@@ -279,36 +281,34 @@ def _overlap_ratio(box_a, box_b):
     area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
     return inter / area_a if area_a > 0 else 0
 
-
-def merge_boxes(yolo_boxes, florence_boxes, iou_threshold=0.3):
+def merge_boxes_smart(yolo_boxes, florence_boxes, iou_threshold=0.5):
     """
-    Merge two sets of bounding boxes, removing near-duplicates.
-    When two boxes overlap significantly, keep the larger one.
+    Merges boxes but gives PRIORITY to YOLO.
+    1. Keep all YOLO boxes.
+    2. Only add a Florence box if it DOES NOT overlap significantly with any YOLO box.
     """
-    all_boxes = list(yolo_boxes) + list(florence_boxes)
-    if not all_boxes:
-        return []
-
-    all_boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-
-    merged = []
-    used = [False] * len(all_boxes)
-
-    for i in range(len(all_boxes)):
-        if used[i]:
-            continue
-        best = list(all_boxes[i])
-        used[i] = True
-        for j in range(i + 1, len(all_boxes)):
-            if used[j]:
-                continue
-            if (_iou(best, all_boxes[j]) > iou_threshold
-                    or _overlap_ratio(all_boxes[j], best) > 0.5):
-                used[j] = True
-        merged.append(best)
-
-    return merged
-
+    # Start with all YOLO boxes as the 'accepted' set
+    # Format: [x1, y1, x2, y2]
+    final_boxes = list(yolo_boxes)
+    
+    # Check each Florence box
+    for f_box in florence_boxes:
+        is_duplicate = False
+        for y_box in final_boxes:
+            # Check overlap
+            iou = _iou(f_box, y_box)
+            overlap_ratio = _overlap_ratio(f_box, y_box) # How much of F is inside Y
+            
+            # If Florence box overlaps heavily with an existing YOLO box, ignore it
+            # (We assume YOLO's crop is better/tighter)
+            if iou > iou_threshold or overlap_ratio > 0.5:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            final_boxes.append(f_box)
+            
+    return final_boxes
 
 # ---------------------------------------------------------------------------
 # Hybrid detection pipeline (YOLO + Florence-2)
@@ -335,7 +335,7 @@ def detect_figures_hybrid(pil_image):
     print(f"      Florence-2 found {len(florence_boxes)} candidate(s)")
 
     # --- Merge ---
-    merged = merge_boxes(yolo_boxes, florence_boxes)
+    merged = merge_boxes_smart(yolo_boxes, florence_boxes)
     print(f"      Merged to {len(merged)} unique region(s)")
 
     # --- Filter obvious bad boxes ---
@@ -372,40 +372,100 @@ def detect_figures_hybrid(pil_image):
 # Crop refinement & saving
 # ---------------------------------------------------------------------------
 
+# def smart_crop_whitespace(pil_image):
+#     """
+#     Splits image based on vertical whitespace gaps (columns).
+#     Keeps the largest segment (the graph).
+#     """
+#     img = np.array(pil_image.convert('L'))
+#     img = 255 - img
+#     _, img = cv2.threshold(img, 20, 1, cv2.THRESH_BINARY)
+#
+#     projection = np.sum(img, axis=0)
+#     height = img.shape[0]
+#     is_ink = projection > (height * 0.01)
+#
+#     segments = []
+#     start = None
+#     for x, has_ink in enumerate(is_ink):
+#         if has_ink and start is None:
+#             start = x
+#         elif not has_ink and start is not None:
+#             segments.append((start, x))
+#             start = None
+#     if start is not None:
+#         segments.append((start, len(is_ink)))
+#
+#     if not segments:
+#         return pil_image
+#
+#     best_segment = max(segments, key=lambda s: np.sum(projection[s[0]:s[1]]))
+#     x1, x2 = best_segment
+#     x1 = max(0, x1 - 10)
+#     x2 = min(pil_image.width, x2 + 10)
+#
+#     return pil_image.crop((x1, 0, x2, pil_image.height))
+
 def smart_crop_whitespace(pil_image):
     """
-    Splits image based on vertical whitespace gaps (columns).
-    Keeps the largest segment (the graph).
+    Tightens the crop by removing whitespace from ALL sides (Left/Right AND Top/Bottom).
     """
-    img = np.array(pil_image.convert('L'))
-    img = 255 - img
-    _, img = cv2.threshold(img, 20, 1, cv2.THRESH_BINARY)
+    # 1. Convert to binary numpy array (0 = white paper, 255 = ink)
+    # We use a lower threshold (200) to catch faint pencil lines
+    gray = np.array(pil_image.convert('L'))
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-    projection = np.sum(img, axis=0)
-    height = img.shape[0]
-    is_ink = projection > (height * 0.01)
+    def get_best_segment(projection, threshold_pct=0.01):
+        """Helper to find the largest chunk of ink in a projection profile."""
+        length = len(projection)
+        threshold = np.max(projection) * threshold_pct
+        
+        is_ink = projection > threshold
+        
+        segments = []
+        start = None
+        for i, has_ink in enumerate(is_ink):
+            if has_ink and start is None:
+                start = i
+            elif not has_ink and start is not None:
+                segments.append((start, i))
+                start = None
+        if start is not None:
+            segments.append((start, length))
+            
+        if not segments:
+            return (0, length)
+            
+        # Return the segment with the most total ink
+        return max(segments, key=lambda s: np.sum(projection[s[0]:s[1]]))
 
-    segments = []
-    start = None
-    for x, has_ink in enumerate(is_ink):
-        if has_ink and start is None:
-            start = x
-        elif not has_ink and start is not None:
-            segments.append((start, x))
-            start = None
-    if start is not None:
-        segments.append((start, len(is_ink)))
-
-    if not segments:
-        return pil_image
-
-    best_segment = max(segments, key=lambda s: np.sum(projection[s[0]:s[1]]))
-    x1, x2 = best_segment
+    # --- PASS 1: VERTICAL (Left/Right) ---
+    # Sum across rows (axis 0) -> 1D array of width
+    v_proj = np.sum(binary, axis=0)
+    x1, x2 = get_best_segment(v_proj)
+    
+    # Apply padding (10px)
     x1 = max(0, x1 - 10)
     x2 = min(pil_image.width, x2 + 10)
-
-    return pil_image.crop((x1, 0, x2, pil_image.height))
-
+    
+    # Crop horizontally first
+    crop_x = pil_image.crop((x1, 0, x2, pil_image.height))
+    
+    # --- PASS 2: HORIZONTAL (Top/Bottom) ---
+    # Re-calculate binary on the new crop
+    gray_x = np.array(crop_x.convert('L'))
+    _, binary_x = cv2.threshold(gray_x, 200, 255, cv2.THRESH_BINARY_INV)
+    
+    # Sum across columns (axis 1) -> 1D array of height
+    h_proj = np.sum(binary_x, axis=1)
+    y1, y2 = get_best_segment(h_proj)
+    
+    # Apply padding
+    y1 = max(0, y1 - 10)
+    y2 = min(crop_x.height, y2 + 10)
+    
+    # Final Crop
+    return crop_x.crop((0, y1, crop_x.width, y2))
 
 def is_crop_dirty(pil_crop):
     """
@@ -427,6 +487,75 @@ def is_crop_dirty(pil_crop):
                 return True
     return False
 
+def detect_figures_qwen(pil_image, VLM_MODEL):
+    """
+    Asks Qwen to perform Visual Grounding to find figures.
+    Returns: List of [x1, y1, x2, y2]
+    """
+    width, height = pil_image.size
+    
+    # We resize for detection to save VRAM (optional, but recommended for 8GB cards)
+    # 1024px is usually enough to see a layout.
+    detect_scale = 1024 / max(width, height)
+    new_w = int(width * detect_scale)
+    new_h = int(height * detect_scale)
+    resized_img = pil_image.resize((new_w, new_h))
+    
+    img_bytes = pil_to_bytes(resized_img)
+
+    # VISUAL GROUNDING PROMPT
+    # We ask for a JSON object with a specific normalized scale (0-1000)
+    PROMPT = """
+    Detect all technical diagrams, charts, graphs, and figures in this document page.
+    Ignore standard text, math formulas, and page headers.
+    
+    Return a JSON object with a list of bounding boxes in 0-1000 scale:
+    {
+        "figures": [
+            [ymin, xmin, ymax, xmax],
+            [ymin, xmin, ymax, xmax]
+        ]
+    }
+    If no figures are found, return {"figures": []}.
+    """
+
+    try:
+        response = ollama.chat(
+            model=VLM_MODEL,
+            messages=[{'role': 'user', 'content': PROMPT, 'images': [img_bytes]}],
+            options={"temperature": 0} # Deterministic output
+        )
+        content = response['message']['content']
+        
+        # Parse JSON from the response (it might wrap it in ```json ... ```)
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            boxes_1000 = data.get("figures", [])
+            
+            pixel_boxes = []
+            for box in boxes_1000:
+                # Qwen 2.5 often outputs [ymin, xmin, ymax, xmax] 
+                # Be careful: standard convention is sometimes [xmin, ymin, xmax, ymax]
+                # The prompt explicitly asked for [ymin, xmin...], so we respect that.
+                ymin, xmin, ymax, xmax = box
+                
+                # Convert back to original image pixels
+                # x = (value / 1000) * original_width
+                x1 = int((xmin / 1000) * width)
+                y1 = int((ymin / 1000) * height)
+                x2 = int((xmax / 1000) * width)
+                y2 = int((ymax / 1000) * height)
+                
+                pixel_boxes.append([x1, y1, x2, y2])
+                
+            return pixel_boxes
+
+    except Exception as e:
+        print(f"      ⚠️ Qwen Detection Error: {e}")
+        # print(f"      Raw Content: {content}") # Uncomment to debug
+        
+    return []
 
 def crop_and_save_figures(original_img, bboxes, page_num, pdf_name, figures_dir):
     """
@@ -457,10 +586,10 @@ def crop_and_save_figures(original_img, bboxes, page_num, pdf_name, figures_dir)
         while is_crop_dirty(crop) and dirty_counter < 3:
             crop = smart_crop_whitespace(crop)
             dirty_counter += 1
-
-        # Final Florence-2 refinement if still dirty
-        if is_crop_dirty(crop):
-            crop = refine_crop_florence(crop)
+        #
+        # # Final Florence-2 refinement if still dirty
+        # if is_crop_dirty(crop):
+        #     crop = refine_crop_florence(crop)
 
         # Save
         clean_name = pdf_name.replace(".pdf", "").replace(" ", "_")

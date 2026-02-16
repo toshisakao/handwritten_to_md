@@ -8,9 +8,14 @@ from utils import *
 from figure_detection import *
 from ocr import preprocess_for_ocr, transcribe_text
 
+from credentials import GOOGLE_API_KEY
+
 # --- CONFIGURATION ---
 input_path = "./test/"
 output_path = "./test_out"
+
+# --- CLOUD SWITCH ---
+CLOUD_MODE = True  # Set to True to use Gemini, False for Local Qwen
 
 # READER MODEL (Ollama)
 OCR_MODEL = "qwen3-vl"
